@@ -208,7 +208,6 @@ def procesar_nuevas_caracteristicas(df):
     df_mod['eett_anio_vig'], df_mod['eett_mes_vig'], df_mod['eett_dia_vig'] = extraer_componentes_fecha(df_mod['eett_fec_ini_vig'])
     df_mod['rango_es_abierto'] = df_mod['rango_fin'].isna().astype(float)
     
-    # Cálculos derivados
     tarifa_agua = pd.to_numeric(df_mod['tarifa_agua'], errors='coerce').fillna(0)
     tarifa_alcanta = pd.to_numeric(df_mod['tarifa_alcanta'], errors='coerce').fillna(0)
     rango_ini = pd.to_numeric(df_mod['rango_ini'], errors='coerce').fillna(0)
@@ -321,6 +320,16 @@ def limpiar_columnas(df, columnas_a_eliminar):
     cols_existentes = [col for col in columnas_a_eliminar if col in df.columns]
     return df.drop(columns=cols_existentes)
 
+def preparar_export_limpio(df):
+    df_export = df.dropna(axis=1, how='all').copy()
+    columnas_texto = df_export.select_dtypes(include=['object', 'string']).columns
+    for col in columnas_texto:
+        serie = df_export[col].astype(str).str.strip()
+        vacios = serie.eq("") | serie.str.lower().isin(["nan", "none", "null"])
+        if vacios.all():
+            df_export.drop(columns=[col], inplace=True)
+    return df_export
+
 def inyectar_anomalias(df_limpio, columnas_num):
     num_anomalos = int(len(df_limpio) * 0.3)
     indices_aleatorios = np.random.choice(df_limpio.index, size=num_anomalos, replace=False)
@@ -412,6 +421,10 @@ if __name__ == "__main__":
     asegurar_dataset_descargado(ruta_dataset)
     df_original = pd.read_csv(ruta_dataset, sep=';', low_memory=False)
 
+    ruta_dataset_original_comas = os.path.join(dir_run, "dataset_original_comas.csv")
+    df_original.to_csv(ruta_dataset_original_comas, sep=',', index=False, encoding='utf-8')
+    registrar_progreso(f"Dataset original con separador coma guardado en {ruta_dataset_original_comas}")
+
     cols_num = CONFIG_PIPELINE["columnas_base"]["numericas"]
     cols_cat = CONFIG_PIPELINE["columnas_base"]["categoricas"]
 
@@ -419,50 +432,47 @@ if __name__ == "__main__":
     df_base = procesar_listas_numericas(df_base, CONFIG_PIPELINE["transformaciones_numericas"].get("promediar_listas", []))
     auditar_datos_invalidos(df_base, cols_num, cols_cat, CONFIG_PIPELINE)
 
-    # Inyección de anomalías
+    ruta_dataset_limpio = os.path.join(dir_run, "dataset_limpio.csv")
+    df_base_export = preparar_export_limpio(df_base)
+    df_base_export.to_csv(ruta_dataset_limpio, sep=',', index=False, encoding='utf-8')
+    registrar_progreso(f"Dataset limpio guardado en {ruta_dataset_limpio}")
+
     df_final = inyectar_anomalias(df_base, CONFIG_PIPELINE["anomalias"]["columnas_inyectar"])
+    ruta_dataset_anomalias = os.path.join(dir_run, "dataset_con_anomalias_etiquetado.csv")
+    df_final.to_csv(ruta_dataset_anomalias, sep=',', index=False, encoding='utf-8')
+    registrar_progreso(f"Dataset con anomalías etiquetadas guardado en {ruta_dataset_anomalias}")
     
-    # Prevenir Data Leakage: División antes de Imputar/Codificar
     df_train, df_test = dividir_entrenamiento_prueba(df_final, proporcion_prueba=0.2)
 
-    # Procesar características derivadas
     df_train_proc = procesar_nuevas_caracteristicas(df_train)
     df_test_proc = procesar_nuevas_caracteristicas(df_test)
 
-    # Entrenar y Aplicar Imputación
     valores_imputacion = entrenar_imputador_config(df_train_proc, CONFIG_PIPELINE["transformaciones_numericas"])
     df_train_imp = aplicar_imputador_config(df_train_proc, CONFIG_PIPELINE["transformaciones_numericas"], valores_imputacion)
     df_test_imp = aplicar_imputador_config(df_test_proc, CONFIG_PIPELINE["transformaciones_numericas"], valores_imputacion)
 
-    # Entrenar y Aplicar Codificación
     mapa_codificacion = entrenar_codificador_config(df_train_imp, CONFIG_PIPELINE["transformaciones_categoricas"])
     df_train_cod, cols_gen = aplicar_codificador_config(df_train_imp, mapa_codificacion)
     df_test_cod, _ = aplicar_codificador_config(df_test_imp, mapa_codificacion)
 
-    # Limpiar Columnas Obsoletas
     df_train_limpio = limpiar_columnas(df_train_cod, CONFIG_PIPELINE["columnas_a_eliminar"])
     df_test_limpio = limpiar_columnas(df_test_cod, CONFIG_PIPELINE["columnas_a_eliminar"])
 
-    # Separar Features (X) y Target (y)
     columnas_modelo = [c for c in df_train_limpio.columns if c not in cols_cat and c != 'etiqueta_anomalia']
     X_train_raw = df_train_limpio[columnas_modelo].fillna(0).values
     y_train = df_train_limpio['etiqueta_anomalia'].values
     X_test_raw = df_test_limpio[columnas_modelo].fillna(0).values
     y_test = df_test_limpio['etiqueta_anomalia'].values
 
-    # Estandarización
     medias_X, desv_X = estandarizar_datos_fit(X_train_raw)
     X_train = estandarizar_datos_transform(X_train_raw, medias_X, desv_X)
     X_test = estandarizar_datos_transform(X_test_raw, medias_X, desv_X)
 
-    # Entrenamiento del Modelo
     pesos_optimos, sesgo_optimo, costos = entrenar_regresion_logistica(X_train, y_train, tasa_aprendizaje=0.1, iteraciones=8000, tolerancia=1e-6, lambda_l2=0.5)
     
-    # Evaluación
     y_prediccion = predecir(X_test, pesos_optimos, sesgo_optimo, umbral=0.25)
     TP, TN, FP, FN, acc, prec, rec, f1 = calcular_metricas(y_test, y_prediccion)
 
-    # Resumen (Sin log de transformaciones)
     resumen_metricas = f"""========================================
 RESUMEN DE RESULTADOS DEL MODELO
 ========================================
@@ -489,7 +499,6 @@ Métricas de Rendimiento:
     with open(archivo_resumen, "w", encoding="utf-8") as f:
         f.write(resumen_metricas)
 
-    # Gráfico de Costos
     plt.figure(figsize=(8,5))
     plt.plot(costos, color='blue', linewidth=2)
     plt.title('Disminución de la Función de Costo durante el Entrenamiento')
